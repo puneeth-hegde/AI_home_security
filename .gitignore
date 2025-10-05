@@ -1,0 +1,25 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generated data files
+# These are created by the scripts and should not be version controlled.
+encodings.pkl
+*.log
+
+# Dataset folder
+# It's good practice to not commit personal images to a public repo.
+# Add an empty .gitkeep file inside the 'dataset' folder if you want to keep the directory structure.
+dataset/
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
