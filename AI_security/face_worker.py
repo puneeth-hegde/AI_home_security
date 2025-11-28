@@ -5,53 +5,45 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import time
 import glob
 import shutil
-import tensorflow as tf
 import warnings
 from deepface import DeepFace
 from datetime import datetime
+import tensorflow as tf
 
-# --- Suppress TensorFlow Warnings ---
+# --- Suppress Warnings ---
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', category=UserWarning) 
+warnings.filterwarnings('ignore')
 tf.get_logger().setLevel('ERROR')
 
 # --- Configuration ---
 JOBS_DIR = "jobs_face"
 RESULTS_DIR = "results_face"
 PROCESSING_DIR = "jobs_face_processing"
-
-# Points to your "dataset" folder
 DB_PATH = "dataset" 
 
 MODEL_NAME = "Facenet512"
 DETECTOR_BACKEND = "opencv" 
 
-# --- SECURITY UPDATE: STRICTNESS CONTROL ---
-# Lower number = Stricter (Less false positives, but might miss you if lighting is bad)
-# Higher number = Looser (Recognizes you easily, but might mistake friends for you)
-# Recommended for Facenet512: 0.30
-STRICT_THRESHOLD = 0.30
+# --- SECURITY SETTINGS ---
+# 0.15 is extremely strict. It rejects "look-alikes" effectively.
+STRICT_THRESHOLD = 0.15
+ENABLE_LIVENESS = True 
 
 POLLING_INTERVAL = 0.1 
 
-# --- Ensure directories exist ---
+# --- Ensure directories ---
 os.makedirs(JOBS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(PROCESSING_DIR, exist_ok=True)
 
-# --- Load Model at Startup ---
+# --- Load Model ---
 print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Starting...")
-print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Loading DeepFace model ({MODEL_NAME}) into memory...")
 DeepFace.build_model(MODEL_NAME)
-print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Model loaded.")
-
-print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Worker is now running. Watching for jobs in '{JOBS_DIR}'...")
+print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Ready.")
 
 while True:
     try:
         job_files = glob.glob(os.path.join(JOBS_DIR, "*.jpg"))
-        
         if not job_files:
             time.sleep(POLLING_INTERVAL)
             continue
@@ -59,67 +51,66 @@ while True:
         for job_path in job_files:
             job_filename = os.path.basename(job_path)
             job_id = job_filename.split('.')[0] 
-            result_filename = f"result_{job_id}.txt"
-            result_path = os.path.join(RESULTS_DIR, result_filename)
-            
+            result_path = os.path.join(RESULTS_DIR, f"result_{job_id}.txt")
             processing_path = os.path.join(PROCESSING_DIR, job_filename)
-            try:
-                shutil.move(job_path, processing_path) 
-            except Exception:
-                continue 
-            
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] New job received: {job_id}")
             
             try:
-                # --- RUN RECOGNITION ---
+                shutil.move(job_path, processing_path)
+            except: continue 
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Processing: {job_id}")
+            identity = "Unknown"
+            
+            try:
+                # 1. Anti-Spoofing
+                if ENABLE_LIVENESS:
+                    try:
+                        face_objs = DeepFace.extract_faces(
+                            img_path=processing_path,
+                            detector_backend=DETECTOR_BACKEND,
+                            enforce_detection=False,
+                            anti_spoofing=True
+                        )
+                        if len(face_objs) > 0 and not face_objs[0].get("is_real", True):
+                            raise ValueError("Spoof detected")
+                    except ValueError as ve:
+                        if "Spoof" in str(ve): raise ve
+                        pass
+
+                # 2. Recognition
                 dfs = DeepFace.find(
                     img_path=processing_path,
                     db_path=DB_PATH,
                     model_name=MODEL_NAME,
                     detector_backend=DETECTOR_BACKEND,
-                    distance_metric="cosine", # We enforce Cosine distance
+                    distance_metric="cosine", 
                     enforce_detection=False, 
                     silent=True
                 )
                 
-                identity = "Unknown"
-                
                 if len(dfs) > 0 and not dfs[0].empty:
-                    # Get the distance score (Lower is better)
-                    distance_score = dfs[0].iloc[0]["distance"]
-                    
-                    # --- SECURITY CHECK ---
-                    if distance_score <= STRICT_THRESHOLD:
+                    distance = dfs[0].iloc[0]["distance"]
+                    # STRICT CHECK
+                    if distance <= STRICT_THRESHOLD:
                         full_path = dfs[0].iloc[0]["identity"]
-                        parent_folder = os.path.dirname(full_path)
-                        folder_name = os.path.basename(parent_folder)
-                        
-                        if os.path.abspath(parent_folder) == os.path.abspath(DB_PATH):
+                        parent = os.path.dirname(full_path)
+                        if os.path.abspath(parent) == os.path.abspath(DB_PATH):
                             identity = os.path.basename(full_path).split('.')[0]
                         else:
-                            identity = folder_name
-                        
-                        # Debug print to see how confident the AI was
-                        print(f"   >>> Match Found! Distance: {distance_score:.4f} (Limit: {STRICT_THRESHOLD})")
+                            identity = os.path.basename(parent)
+                        print(f"   >>> MATCH: {identity} (Dist: {distance:.4f})")
                     else:
-                        print(f"   >>> Match Rejected. Distance {distance_score:.4f} is too high (Limit: {STRICT_THRESHOLD})")
-                        identity = "Unknown"
-                
-                with open(result_path, "w") as f:
-                    f.write(identity)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Job complete. Result: {identity}")
+                        print(f"   >>> REJECTED: Distance {distance:.4f} > {STRICT_THRESHOLD}")
 
-            except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Error processing {job_id}: {e}")
-                with open(result_path, "w") as f:
-                    f.write("Error")
+                with open(result_path, "w") as f: f.write(identity)
+
+            except ValueError:
+                print("   >>> SPOOF BLOCKED.")
+                with open(result_path, "w") as f: f.write("Fake_Face")
+            except Exception:
+                with open(result_path, "w") as f: f.write("Error")
             
-            if os.path.exists(processing_path):
-                os.remove(processing_path) 
+            if os.path.exists(processing_path): os.remove(processing_path)
 
-    except KeyboardInterrupt:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] Shutdown signal received. Exiting.")
-        break
-    except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE_WORKER] An unexpected error occurred: {e}")
-        time.sleep(1)
+    except KeyboardInterrupt: break
+    except Exception: time.sleep(1)

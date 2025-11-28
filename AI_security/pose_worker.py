@@ -1,95 +1,92 @@
-import cv2
-import mediapipe as mp
 import os
-import glob
 import time
-from datetime import datetime
-import warnings
+import cv2
+import glob
 import shutil
+import math
+import mediapipe as mp
+from datetime import datetime
 
-# --- Suppress Warnings ---
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-warnings.filterwarnings('ignore', category=UserWarning) 
-
-# --- Configuration ---
+# --- CONFIGURATION ---
 JOBS_DIR = "jobs_pose"
 RESULTS_DIR = "results_pose"
-PROCESSING_DIR = "jobs_pose_processing" # --- FIX: New processing directory
-POLLING_INTERVAL = 0.1
+PROCESSING_DIR = "jobs_pose_processing"
+POLLING_INTERVAL = 0.05
 
-# --- Load MediaPipe Model ONCE at Startup ---
-print(f"[{datetime.now()}] [POSE_WORKER] Starting...")
-print(f"[{datetime.now()}] [POSE_WORKER] Loading MediaPipe Pose model into memory...")
+# --- SENSITIVITY SETTINGS ---
+# 0.04 allows detecting slower grapples/shoves
+VIOLENCE_SPEED_THRESHOLD = 0.04 
+
 mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-print(f"[{datetime.now()}] [POSE_WORKER] Model loaded.")
+pose = mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.5)
+tracking_memory = {}
 
-# --- Ensure job/result directories exist ---
 os.makedirs(JOBS_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(PROCESSING_DIR, exist_ok=True) # --- FIX: Create processing dir
+os.makedirs(PROCESSING_DIR, exist_ok=True)
 
-# --- Main Worker Loop ---
-print(f"[{datetime.now()}] [POSE_WORKER] Worker is now running. Watching for jobs in '{JOBS_DIR}'...")
+print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSE_WORKER] Violence Engine Ready.")
+
+def calculate_distance(point_a, point_b):
+    return math.sqrt((point_a.x - point_b.x)**2 + (point_a.y - point_b.y)**2)
+
+def analyze_violence(landmarks, job_id):
+    nose = landmarks[mp_pose.PoseLandmark.NOSE]
+    left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
+    right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
+    
+    # 1. Surrender Check (Wrists above Nose)
+    if (left_wrist.y < nose.y) and (right_wrist.y < nose.y):
+        return "Threat: Surrender Pose"
+
+    # 2. Velocity Check
+    if job_id in tracking_memory:
+        prev_data = tracking_memory[job_id]
+        # Only check speed if timestamps are close (avoid glitch if person left and came back)
+        if time.time() - prev_data['time'] < 1.0: 
+            prev = prev_data['landmarks']
+            speed_l = calculate_distance(left_wrist, prev[mp_pose.PoseLandmark.LEFT_WRIST])
+            speed_r = calculate_distance(right_wrist, prev[mp_pose.PoseLandmark.RIGHT_WRIST])
+            
+            if speed_l > VIOLENCE_SPEED_THRESHOLD or speed_r > VIOLENCE_SPEED_THRESHOLD:
+                return "Threat: Violent Motion"
+            
+    tracking_memory[job_id] = {'landmarks': landmarks, 'time': time.time()}
+    return "Normal"
+
 while True:
     try:
         job_files = glob.glob(os.path.join(JOBS_DIR, "*.jpg"))
-        
         if not job_files:
             time.sleep(POLLING_INTERVAL)
             continue
 
         for job_path in job_files:
             job_filename = os.path.basename(job_path)
-            job_id = job_filename.split('.')[0]
-            result_filename = f"result_{job_id}.txt"
-            result_path = os.path.join(RESULTS_DIR, result_filename)
-            
-            # --- FIX: Atomic File Operation ---
+            job_id = job_filename.split('.')[0] 
+            result_path = os.path.join(RESULTS_DIR, f"result_{job_id}.txt")
             processing_path = os.path.join(PROCESSING_DIR, job_filename)
+            
             try:
                 shutil.move(job_path, processing_path)
-            except Exception as e:
-                continue
-            # --- END FIX ---
-            
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSE_WORKER] New job received: {job_id}")
-            pose_status = "Normal" 
-            
+            except: continue
+
             try:
-                frame = cv2.imread(processing_path)
-                if frame is None:
-                    raise ValueError("Could not read image file")
+                image = cv2.imread(processing_path)
+                if image is None: raise Exception("Empty Image")
+                results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+                status = "Normal"
                 
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pose_results = pose.process(rgb_frame)
+                if results.pose_landmarks:
+                    status = analyze_violence(results.pose_landmarks.landmark, job_id)
+                    if "Threat" in status:
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ALERT] {status} on {job_id}!")
                 
-                if pose_results.pose_landmarks:
-                    landmarks = pose_results.pose_landmarks.landmark
-                    left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
-                    right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
-                    left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
-                    right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
-                    
-                    if (left_wrist.visibility > 0.5 and right_wrist.visibility > 0.5 and
-                        left_shoulder.visibility > 0.5 and right_shoulder.visibility > 0.5): 
-                        if (left_wrist.y < left_shoulder.y) and (right_wrist.y < right_shoulder.y):
-                            pose_status = "Threat: Hands Raised"
-                
-                with open(result_path, "w") as f:
-                    f.write(pose_status)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSE_WORKER] Job complete. Result: {pose_status}")
-
-            except Exception as e:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSE_WORKER] Error processing {job_id}: {e}")
-                with open(result_path, "w") as f:
-                    f.write("Error") 
+                with open(result_path, "w") as f: f.write(status)
+            except:
+                with open(result_path, "w") as f: f.write("Error")
             
-            os.remove(processing_path) # Clean up
+            if os.path.exists(processing_path): os.remove(processing_path)
 
-    except KeyboardInterrupt:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSE_WORKER] Shutdown signal received. Exiting.")
-        break
-    except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSE_WORKER] An unexpected error occurred: {e}")
-        time.sleep(1)
+    except KeyboardInterrupt: break
+    except Exception: time.sleep(1)
