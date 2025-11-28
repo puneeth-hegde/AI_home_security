@@ -13,9 +13,9 @@ RESULTS_DIR = "results_pose"
 PROCESSING_DIR = "jobs_pose_processing"
 POLLING_INTERVAL = 0.05
 
-# --- SENSITIVITY SETTINGS ---
-# 0.04 allows detecting slower grapples/shoves
-VIOLENCE_SPEED_THRESHOLD = 0.04 
+# --- SENSITIVITY ---
+# 0.02 is EXTREMELY sensitive. Even a fast wave will trigger it.
+VIOLENCE_SPEED_THRESHOLD = 0.02 
 
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.5)
@@ -35,19 +35,21 @@ def analyze_violence(landmarks, job_id):
     left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
     right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
     
-    # 1. Surrender Check (Wrists above Nose)
+    # 1. Surrender Check
     if (left_wrist.y < nose.y) and (right_wrist.y < nose.y):
         return "Threat: Surrender Pose"
 
     # 2. Velocity Check
     if job_id in tracking_memory:
         prev_data = tracking_memory[job_id]
-        # Only check speed if timestamps are close (avoid glitch if person left and came back)
         if time.time() - prev_data['time'] < 1.0: 
             prev = prev_data['landmarks']
             speed_l = calculate_distance(left_wrist, prev[mp_pose.PoseLandmark.LEFT_WRIST])
             speed_r = calculate_distance(right_wrist, prev[mp_pose.PoseLandmark.RIGHT_WRIST])
             
+            # DEBUG PRINT: Verify math is happening
+            # print(f"DEBUG: {job_id} Speed L:{speed_l:.4f} R:{speed_r:.4f}")
+
             if speed_l > VIOLENCE_SPEED_THRESHOLD or speed_r > VIOLENCE_SPEED_THRESHOLD:
                 return "Threat: Violent Motion"
             
@@ -73,7 +75,7 @@ while True:
 
             try:
                 image = cv2.imread(processing_path)
-                if image is None: raise Exception("Empty Image")
+                if image is None: raise Exception("Empty")
                 results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
                 status = "Normal"
                 
@@ -89,4 +91,4 @@ while True:
             if os.path.exists(processing_path): os.remove(processing_path)
 
     except KeyboardInterrupt: break
-    except Exception: time.sleep(1)
+    except Exception: time.sleep(0.1)

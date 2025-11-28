@@ -15,14 +15,15 @@ RTSP_URL_GATE = "rtsp://Gate_Camera:CREAKmyPASSWORD1219!!!@192.168.0.115:554/str
 RTSP_URL_DOOR = "rtsp://Door_Camera:CREAKmyPASSWORD1219!!!@192.168.0.120:554/stream1"
 YOLO_MODEL_PATH = "yolov8n.pt"
 
-# --- DISPLAY & PERFORMANCE ---
-AI_WIDTH, AI_HEIGHT = 640, 360       # Small for Speed
-DISPLAY_WIDTH, DISPLAY_HEIGHT = 1280, 720 # Big for Visibility
+# --- DISPLAY SETTINGS (FIT TO SCREEN) ---
+AI_WIDTH, AI_HEIGHT = 640, 360       
+# 960 + 960 = 1920 (Fits standard 1080p Laptop Screen perfectly)
+DISPLAY_WIDTH, DISPLAY_HEIGHT = 960, 540 
 PROCESS_EVERY_N_FRAMES = 3
 
 # --- WEAPON DETECTION ---
-WEAPON_CLASSES = [43, 76, 34] # Knife, Scissors, Bat
-WEAPON_CONFIDENCE = 0.25      # Sensitive for small objects
+WEAPON_CLASSES = [43, 76, 34] 
+WEAPON_CONFIDENCE = 0.20 # Sensitive
 
 # --- PATHS ---
 DIRS = ["jobs_face", "results_face", "jobs_pose", "results_pose"]
@@ -43,7 +44,6 @@ q_door = queue.Queue(maxsize=2)
 stop_event = threading.Event()
 world_state = {}
 
-# --- WORKER THREADS ---
 def cleanup():
     while not stop_event.is_set():
         time.sleep(30)
@@ -52,8 +52,7 @@ def cleanup():
             if os.path.exists(d):
                 for f in os.listdir(d):
                     try:
-                        p = os.path.join(d, f)
-                        if os.path.getmtime(p) < now - 30: os.remove(p)
+                        if os.path.getmtime(os.path.join(d, f)) < now - 30: os.remove(os.path.join(d, f))
                     except: pass
 
 def capture(url, q, name):
@@ -86,6 +85,7 @@ def check_results():
                 world_state[jid]['identity'] = res
             os.remove(f)
         except: pass
+
     for f in glob.glob("results_pose/*.txt"):
         try:
             jid = os.path.basename(f).replace('result_', '').replace('.txt', '')
@@ -95,7 +95,6 @@ def check_results():
             os.remove(f)
         except: pass
 
-# --- STARTUP ---
 for d in DIRS: 
     if not os.path.exists(d): os.makedirs(d)
     for f in glob.glob(f"{d}/*"): os.remove(f)
@@ -106,7 +105,6 @@ threading.Thread(target=cleanup, daemon=True).start()
 
 time.sleep(2) 
 
-# --- MAIN LOOP ---
 frame_cnt = 0
 cached_gate_boxes = []
 cached_door_boxes = []
@@ -121,11 +119,9 @@ while not stop_event.is_set():
 
     frame_cnt += 1
     
-    # Resize for AI
     ai_gate = cv2.resize(img_gate, (AI_WIDTH, AI_HEIGHT))
     ai_door = cv2.resize(img_door, (AI_WIDTH, AI_HEIGHT))
 
-    # --- AI LOGIC ---
     if frame_cnt % PROCESS_EVERY_N_FRAMES == 0:
         detected_weapons = []
         classes = [0] + WEAPON_CLASSES
@@ -172,11 +168,10 @@ while not stop_event.is_set():
     check_results()
 
     # --- DRAWING ---
-    # Resize Original HD frames for Display
+    # Resize for Display (Fit Screen)
     disp_gate = cv2.resize(img_gate, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
     disp_door = cv2.resize(img_door, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
     
-    # Scale Ratio
     sx = DISPLAY_WIDTH / AI_WIDTH
     sy = DISPLAY_HEIGHT / AI_HEIGHT
 
@@ -204,7 +199,7 @@ while not stop_event.is_set():
         cv2.putText(combined, "WEAPON DETECTED!", (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 4)
         weapon_timer -= 1
 
-    cv2.imshow("Security System (FINAL)", combined)
+    cv2.imshow("Security System", combined)
     if cv2.waitKey(1) == ord('q'): break
 
 stop_event.set()
