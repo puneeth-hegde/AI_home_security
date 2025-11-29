@@ -1,4 +1,4 @@
-# main_app.py - SENTINEL BRAIN (OPTIMIZED)
+# main_app_v2.py - SENTINEL BRAIN (FIXED & ENHANCED)
 import cv2
 import os
 import time
@@ -23,33 +23,37 @@ YOLO_MODEL_PATH = "yolov8n.pt"
 AI_WIDTH, AI_HEIGHT = 640, 360
 DISPLAY_WIDTH, DISPLAY_HEIGHT = 960, 540
 
-# Commands
-CMD_FILE = "audio_cmd.txt"
+# Audio queue directory
+AUDIO_QUEUE_DIR = "audio_queue"
 RESP_FILE = "audio_resp.txt"
 
 # Authorized users
 AUTHORIZED_USERS = ["puneeth"]
 
-# Movement thresholds (TUNED)
-LATERAL_RUN_SPEED = 65.0      # pixels/sec in X/Y plane
-Z_APPROACH_RATE = 0.40        # 40% bbox growth per second
-CHARGING_THRESHOLD = 50.0     # lateral + z-axis combo
-WALK_SPEED_MIN = 15.0         # minimum for "walking" classification
+# Movement thresholds
+LATERAL_RUN_SPEED = 65.0
+Z_APPROACH_RATE = 0.40
+CHARGING_THRESHOLD = 50.0
+WALK_SPEED_MIN = 15.0
 
 # Posture thresholds (4-SIGNAL LOGIC)
-CRAWL_ASPECT_MIN = 1.6        # width/height ratio
-CRAWL_CENTROID_MIN = 0.70     # normalized Y position (0=top, 1=bottom)
-CRAWL_HEIGHT_MAX = 0.35       # bbox height as % of frame
-CRAWL_HIPS_MIN = 0.75         # hip Y position from pose worker
+CRAWL_ASPECT_MIN = 1.6
+CRAWL_CENTROID_MIN = 0.70
+CRAWL_HEIGHT_MAX = 0.35
+CRAWL_HIPS_MIN = 0.75
 
 # Weapon detection
-WEAPON_CLASSES = [43, 76]     # knife, scissors (removed 34)
-WEAPON_CONF = 0.25            # raised from 0.20 to reduce noise
-WEAPON_PERSIST_FRAMES = 5     # must see weapon in 5 frames
-WEAPON_HAND_DIST = 60         # pixels from wrist
+WEAPON_CLASSES = [43, 76]  # knife, scissors
+WEAPON_CONF = 0.25
+WEAPON_PERSIST_FRAMES = 5
+WEAPON_HAND_DIST_NORMALIZED = 0.15  # 15% of image width
 
-# Package classes (for delivery detection)
-PACKAGE_CLASSES = [24, 25, 26, 27, 28]  # backpack, umbrella, handbag, tie, suitcase
+# Package classes
+PACKAGE_CLASSES = [24, 25, 26, 27, 28]
+
+# Hostage detection
+HOSTAGE_DISTANCE_THRESHOLD = 100  # pixels at 640x360
+HOSTAGE_CHECK_INTERVAL = 10  # frames
 
 # ============================================================================
 # LOGGING SYSTEM
@@ -58,28 +62,24 @@ os.makedirs("logs", exist_ok=True)
 
 class SentinelLogger:
     def __init__(self):
-        # Detection logger (all events)
         self.det = logging.getLogger('detection')
         det_handler = logging.FileHandler('logs/detection.log')
         det_handler.setFormatter(logging.Formatter('[%(asctime)s] %(message)s'))
         self.det.addHandler(det_handler)
         self.det.setLevel(logging.INFO)
         
-        # Threat logger (security only)
         self.threat = logging.getLogger('threat')
         threat_handler = logging.FileHandler('logs/threat.log')
         threat_handler.setFormatter(logging.Formatter('[%(asctime)s] [ALERT] %(message)s'))
         self.threat.addHandler(threat_handler)
         self.threat.setLevel(logging.WARNING)
         
-        # Performance logger
         self.perf = logging.getLogger('performance')
         perf_handler = logging.FileHandler('logs/performance.log')
         perf_handler.setFormatter(logging.Formatter('[%(asctime)s] [PERF] %(message)s'))
         self.perf.addHandler(perf_handler)
         self.perf.setLevel(logging.DEBUG)
         
-        # Console output
         console = logging.StreamHandler()
         console.setLevel(logging.INFO)
         console.setFormatter(logging.Formatter('[%(asctime)s] [%(name)s] %(message)s'))
@@ -104,7 +104,7 @@ logger = SentinelLogger()
 # SYSTEM INITIALIZATION
 # ============================================================================
 print("=" * 80)
-print("SENTINEL v3.0 - CONTEXT-AWARE SECURITY SYSTEM")
+print("SENTINEL v3.0 - CONTEXT-AWARE SECURITY SYSTEM (FIXED)")
 print("=" * 80)
 
 gpu = torch.cuda.is_available()
@@ -123,18 +123,34 @@ q_door = queue.Queue(maxsize=2)
 
 # State management
 person_memory = {}
-weapon_evidence = {}  # {person_id: {weapon_class: [frame_numbers]}}
+weapon_evidence = {}
 last_verified_time = 0
 frame_cnt = 0
+command_counter = 0  # For unique command IDs
+
+# Setup audio queue
+os.makedirs(AUDIO_QUEUE_DIR, exist_ok=True)
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
-def send_cmd(text):
+def send_cmd(text, priority=2):
+    """
+    Send command to audio queue with priority
+    Priority: 0=URGENT, 1=HIGH, 2=NORMAL, 3=LOW
+    """
+    global command_counter
     try:
-        with open(CMD_FILE, "w") as f:
+        timestamp = int(time.time() * 1000)
+        command_counter += 1
+        # Format: priority_timestamp_counter.txt
+        filename = f"{priority}_{timestamp}_{command_counter}.txt"
+        filepath = os.path.join(AUDIO_QUEUE_DIR, filename)
+        
+        with open(filepath, "w") as f:
             f.write(text)
-        logger.log_detection("AUDIO", "CMD", text, 1.0, {})
+        
+        logger.log_detection("AUDIO", "CMD", text, 1.0, {"priority": priority})
     except Exception as e:
         logger.log_threat("AUDIO_FAILURE", "SYSTEM", {"error": str(e)})
 
@@ -144,8 +160,14 @@ def bbox_center(bbox):
 def bbox_area(bbox):
     return (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
 
+def bbox_width(bbox):
+    return bbox[2] - bbox[0]
+
+def bbox_height(bbox):
+    return bbox[3] - bbox[1]
+
 # ============================================================================
-# MOVEMENT ANALYSIS (DIRECTIONAL)
+# MOVEMENT ANALYSIS
 # ============================================================================
 def analyze_movement(person_id, current_bbox, prev_bbox, dt, frame_dims):
     """
@@ -158,20 +180,17 @@ def analyze_movement(person_id, current_bbox, prev_bbox, dt, frame_dims):
     cx, cy = bbox_center(current_bbox)
     px, py = bbox_center(prev_bbox)
     
-    # Lateral velocity (actual running in X/Y plane)
     lateral_dist = np.hypot(cx - px, cy - py)
     lateral_speed = lateral_dist / dt
     
-    # Z-axis growth (approaching camera)
     curr_area = bbox_area(current_bbox)
     prev_area = bbox_area(prev_bbox)
     
     if prev_area > 0:
-        z_growth_rate = (curr_area / prev_area - 1.0) / dt  # % per second
+        z_growth_rate = (curr_area / prev_area - 1.0) / dt
     else:
         z_growth_rate = 0.0
     
-    # CLASSIFICATION LOGIC
     is_running = lateral_speed > LATERAL_RUN_SPEED
     is_charging = (lateral_speed > CHARGING_THRESHOLD) and (z_growth_rate > Z_APPROACH_RATE * 0.7)
     is_walking = lateral_speed > WALK_SPEED_MIN and lateral_speed < LATERAL_RUN_SPEED
@@ -202,58 +221,62 @@ def analyze_posture(person_id, bbox, frame_height, pose_hints):
     Returns: (status, confidence, metadata)
     """
     x1, y1, x2, y2 = bbox
-    w, h = x2 - x1, y2 - y1
+    width = bbox_width(bbox)
+    height = bbox_height(bbox)
     
-    if h < 1:
-        return "UNKNOWN", 0.0, {}
+    if height == 0:
+        return "IDLE", 0.5, {}
     
-    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    aspect_ratio = width / height
+    centroid_y = (y1 + y2) / 2 / frame_height
+    bbox_height_ratio = height / frame_height
     
-    # Signal 1: Aspect Ratio
-    aspect = w / h
-    
-    # Signal 2: Centroid Height (normalized)
-    centroid_ratio = cy / frame_height
-    
-    # Signal 3: Bbox Height Ratio
-    height_ratio = h / frame_height
-    
-    # Signal 4: Hip Position from pose_worker
+    # Get hips position from pose worker
     hips_y = pose_hints.get('hips_y', 0.5)
     
     metadata = {
-        "aspect": round(aspect, 2),
-        "centroid_y": round(centroid_ratio, 2),
-        "height_ratio": round(height_ratio, 2),
+        "aspect": round(aspect_ratio, 2),
+        "centroid_y": round(centroid_y, 2),
+        "bbox_height": round(bbox_height_ratio, 2),
         "hips_y": round(hips_y, 2)
     }
     
-    # CRAWLER DETECTION (ALL 4 signals must match)
-    crawler_signals = 0
-    if aspect > CRAWL_ASPECT_MIN:
-        crawler_signals += 1
-    if centroid_ratio > CRAWL_CENTROID_MIN:
-        crawler_signals += 1
-    if height_ratio < CRAWL_HEIGHT_MAX:
-        crawler_signals += 1
+    # Count signals
+    signals = 0
+    
+    if aspect_ratio > CRAWL_ASPECT_MIN:
+        signals += 1
+        metadata['signal_aspect'] = 1
+    
+    if centroid_y > CRAWL_CENTROID_MIN:
+        signals += 1
+        metadata['signal_centroid'] = 1
+    
+    if bbox_height_ratio < CRAWL_HEIGHT_MAX:
+        signals += 1
+        metadata['signal_height'] = 1
+    
     if hips_y > CRAWL_HIPS_MIN:
-        crawler_signals += 1
+        signals += 1
+        metadata['signal_hips'] = 1
     
-    metadata["crawler_signals"] = f"{crawler_signals}/4"
+    metadata['signals'] = signals
     
-    if crawler_signals >= 3:  # Need at least 3/4 signals
-        logger.log_threat("CRAWLER_DETECTED", person_id, metadata)
+    # Need 3+ signals for crawling
+    if signals >= 3:
+        logger.log_threat("CRAWLING_POSTURE", person_id, metadata)
         return "CRAWLING", 0.90, metadata
     
-    # Everything else is IDLE (including sitting)
     return "IDLE", 0.85, metadata
 
 # ============================================================================
-# WEAPON VALIDATION (TEMPORAL PERSISTENCE)
+# WEAPON VALIDATION
 # ============================================================================
-def validate_weapon(person_id, weapon_class, frame_no, weapon_bbox, person_pose):
+def validate_weapon(person_id, weapon_class, frame_no, weapon_bbox, pose_hints, img_width):
     """
-    Requires 5+ detections in recent frames AND hand proximity
+    Validates weapon detection using:
+    1. Temporal persistence (must see in multiple frames)
+    2. Hand proximity (weapon near wrist)
     Returns: (is_valid, reason)
     """
     if person_id not in weapon_evidence:
@@ -264,165 +287,188 @@ def validate_weapon(person_id, weapon_class, frame_no, weapon_bbox, person_pose)
     if weapon_name not in weapon_evidence[person_id]:
         weapon_evidence[person_id][weapon_name] = []
     
-    # Add evidence
     weapon_evidence[person_id][weapon_name].append({
         'frame': frame_no,
         'bbox': weapon_bbox
     })
     
-    # Keep only recent frames (last 20 frames = ~0.66s at 30fps)
     recent = [e for e in weapon_evidence[person_id][weapon_name] if frame_no - e['frame'] < 20]
     weapon_evidence[person_id][weapon_name] = recent
     
     # Check persistence
     if len(recent) < WEAPON_PERSIST_FRAMES:
-        return False, f"INSUFFICIENT_FRAMES_{len(recent)}/{WEAPON_PERSIST_FRAMES}"
+        return False, f"Insufficient persistence: {len(recent)}/{WEAPON_PERSIST_FRAMES}"
     
     # Check hand proximity (if pose data available)
-    if person_pose:
-        weapon_center = ((weapon_bbox[0] + weapon_bbox[2]) / 2, 
-                         (weapon_bbox[1] + weapon_bbox[3]) / 2)
+    if 'left_wrist_x' in pose_hints and 'right_wrist_x' in pose_hints:
+        weapon_center_x = (weapon_bbox[0] + weapon_bbox[2]) / 2
+        weapon_center_y = (weapon_bbox[1] + weapon_bbox[3]) / 2
         
-        left_wrist = person_pose.get('left_wrist', (9999, 9999))
-        right_wrist = person_pose.get('right_wrist', (9999, 9999))
+        left_wrist = (pose_hints['left_wrist_x'] * img_width, pose_hints['left_wrist_y'] * img_width)
+        right_wrist = (pose_hints['right_wrist_x'] * img_width, pose_hints['right_wrist_y'] * img_width)
         
-        dist_left = np.hypot(weapon_center[0] - left_wrist[0], weapon_center[1] - left_wrist[1])
-        dist_right = np.hypot(weapon_center[0] - right_wrist[0], weapon_center[1] - right_wrist[1])
+        dist_left = np.hypot(weapon_center_x - left_wrist[0], weapon_center_y - left_wrist[1])
+        dist_right = np.hypot(weapon_center_x - right_wrist[0], weapon_center_y - right_wrist[1])
         
         min_dist = min(dist_left, dist_right)
+        threshold_dist = img_width * WEAPON_HAND_DIST_NORMALIZED
         
-        if min_dist > WEAPON_HAND_DIST:
-            return False, f"FAR_FROM_HANDS_dist={min_dist:.1f}px"
-    
-    # VALID WEAPON
-    logger.log_threat("WEAPON_VALIDATED", person_id, {
-        "weapon": weapon_name,
-        "frames": len(recent),
-        "persistence": "CONFIRMED"
-    })
-    return True, "CONFIRMED"
+        if min_dist > threshold_dist:
+            return False, f"Too far from hands: {min_dist:.1f}px > {threshold_dist:.1f}px"
+        
+        return True, f"Near hand ({min_dist:.1f}px), {len(recent)} frames"
+    else:
+        # No pose data, rely on persistence only
+        return True, f"Persistent detection: {len(recent)} frames (no pose data)"
 
 # ============================================================================
-# HOSTAGE DETECTION (PROXIMITY + TIMING)
+# HOSTAGE DETECTION
 # ============================================================================
-def detect_hostage_situation(verified_users, unknown_users):
+def detect_hostage_situation(verified_persons, unknown_persons, camera_type):
     """
-    Detects Unknown person within 150px of verified user
-    Returns: threat_dict or None
+    Detects if an unknown person is dangerously close to a verified user
+    Camera-aware: door camera (top-down) vs gate camera (frontal)
+    Returns: (is_hostage, evidence)
     """
-    for v_id, v_data in verified_users.items():
-        for u_id, u_data in unknown_users.items():
-            v_center = bbox_center(v_data['bbox'])
-            u_center = bbox_center(u_data['bbox'])
+    for v_id, v_data in verified_persons.items():
+        v_center = v_data['center']
+        v_cam = 'door' if 'door' in v_id else 'gate'
+        
+        for u_id, u_data in unknown_persons.items():
+            u_center = u_data['center']
+            u_cam = 'door' if 'door' in u_id else 'gate'
             
+            # Must be same camera
+            if v_cam != u_cam:
+                continue
+            
+            # Calculate distance
             distance = np.hypot(v_center[0] - u_center[0], v_center[1] - u_center[1])
             
-            # Check timing (unknown appeared after verified)
-            time_gap = u_data['timestamp'] - v_data['timestamp']
-            
-            # Check if unknown is behind (spatially)
-            is_behind = u_center[1] < v_center[1]
-            
-            if distance < 150 and 0 < time_gap < 5.0 and is_behind:
-                evidence = {
-                    "verified_user": v_data['identity'],
-                    "unknown_id": u_id,
-                    "distance_px": round(distance, 1),
-                    "time_gap": round(time_gap, 2),
-                    "spatial": "BEHIND"
-                }
-                logger.log_threat("HOSTAGE_PATTERN", u_id, evidence)
-                return evidence
+            if distance < HOSTAGE_DISTANCE_THRESHOLD:
+                # Check if unknown is "behind" based on camera type
+                is_behind = False
+                
+                if v_cam == 'door':  # Top-down camera
+                    # "Behind" means higher Y (further from door)
+                    if u_center[1] < v_center[1] - 30:
+                        is_behind = True
+                else:  # Gate camera (frontal)
+                    # "Behind" means similar Y but further X
+                    if abs(u_center[1] - v_center[1]) < 50 and u_center[0] > v_center[0] + 40:
+                        is_behind = True
+                
+                if is_behind:
+                    evidence = {
+                        "verified_person": v_id,
+                        "unknown_person": u_id,
+                        "distance": round(distance, 1),
+                        "camera": v_cam,
+                        "verified_pos": [round(v_center[0], 1), round(v_center[1], 1)],
+                        "unknown_pos": [round(u_center[0], 1), round(u_center[1], 1)]
+                    }
+                    return True, evidence
     
-    return None
+    return False, {}
 
 # ============================================================================
-# RESULT CHECKING (FACE & POSE WORKERS)
+# WORKER RESULT CHECKING
 # ============================================================================
 def check_results():
-    global last_verified_time
+    """Check and process results from face and pose workers"""
     
     # FACE RESULTS
-    for f in glob.glob("results_face/*.txt"):
+    face_results = glob.glob("results_face/result_*.txt")
+    for result_file in face_results:
         try:
-            jid = os.path.basename(f).split('.')[0].replace('result_', '')
-            with open(f, 'r') as file:
-                res = file.read().strip()
+            job_id = os.path.basename(result_file).replace("result_", "").replace(".txt", "")
             
-            if jid in person_memory:
-                mem = person_memory[jid]
+            with open(result_file, 'r') as f:
+                res = f.read().strip()
+            
+            if job_id in person_memory:
+                mem = person_memory[job_id]
                 mem['face'] = res
                 
                 # Anti-spoof handling
                 if "ERROR:SPOOF" in res:
-                    logger.log_threat("SPOOF_DETECTED", jid, {"reason": res})
-                    send_cmd("FIX_BLUR")
+                    logger.log_threat("SPOOF_DETECTED", job_id, {"reason": res})
+                    send_cmd("STEP_CLOSER", priority=2)
                     mem['status'] = 'SUSPECTED_SPOOF'
                 
                 # Valid identity
-                elif res not in ["Unknown", "Verifying...", "ERROR:BLURRY", "ERROR:DARK", "Error"]:
+                elif res not in ["Unknown", "Verifying...", "ERROR:BLURRY", "ERROR:DARK", "ERROR:BRIGHT", "ERROR:FLAT", "Error"]:
+                    global last_verified_time
                     last_verified_time = time.time()
                     if mem['status'] != 'VERIFIED':
                         mem['status'] = 'VERIFIED'
                         mem['identity'] = res
-                        logger.log_detection("DOOR", jid, "VERIFIED", 0.95, {"identity": res})
-                        send_cmd(f"WELCOME:{res}")
+                        logger.log_detection(mem.get('camera', 'UNKNOWN'), job_id, "VERIFIED", 0.95, {"identity": res})
+                        send_cmd(f"WELCOME:{res}", priority=2)
                 
+                # Unknown but stable
                 elif res == "Unknown":
                     if time.time() - last_verified_time > 15.0:
-                        if time.time() - mem['start_time'] > 8.0 and not mem['warned']:
-                            logger.log_detection("DOOR", jid, "STRANGER_LINGERING", 0.80, {})
+                        if time.time() - mem['start_time'] > 8.0 and not mem.get('warned', False):
+                            logger.log_detection(mem.get('camera', 'UNKNOWN'), job_id, "STRANGER_LINGERING", 0.80, {})
                             mem['warned'] = True
-                            send_cmd("ASK_NAME")
+                            send_cmd("ASK_NAME", priority=2)
                 
+                # Quality issues
                 elif res == "ERROR:BLURRY":
-                    send_cmd("FIX_BLUR")
+                    send_cmd("FIX_BLUR", priority=3)
                 elif res == "ERROR:DARK":
-                    send_cmd("FIX_DARK")
+                    send_cmd("FIX_DARK", priority=3)
+                elif res == "ERROR:BRIGHT":
+                    send_cmd("FIX_BRIGHT", priority=3)
             
-            os.remove(f)
+            os.remove(result_file)
         except Exception as e:
             logger.log_threat("RESULT_PARSE_ERROR", "face", {"error": str(e)})
     
     # POSE RESULTS
-    for f in glob.glob("results_pose/*.txt"):
+    pose_results = glob.glob("results_pose/result_*.txt")
+    for result_file in pose_results:
         try:
-            jid = os.path.basename(f).split('.')[0].replace('result_', '')
-            with open(f, 'r') as file:
-                res = file.read().strip()
+            job_id = os.path.basename(result_file).replace("result_", "").replace(".txt", "")
             
-            if jid in person_memory:
-                person_memory[jid]['pose_raw'] = res
+            with open(result_file, 'r') as f:
+                result_text = f.read().strip()
+            
+            if job_id in person_memory:
+                # Parse: "VIOLENCE|1.85|hips_y=0.45,left_wrist_x=0.3,..."
+                parts = result_text.split('|')
+                status = parts[0]
+                velocity = float(parts[1]) if len(parts) > 1 else 0.0
                 
-                # Parse: STATUS|speed|hips_y=0.85,history_len=8
-                parts = res.split('|')
-                status = parts[0] if len(parts) > 0 else 'Normal'
-                
-                # Extract metadata
-                meta = {}
-                if len(parts) >= 3:
+                # Parse metadata
+                metadata = {}
+                if len(parts) >= 3 and parts[2]:
                     for kv in parts[2].split(','):
                         if '=' in kv:
                             k, v = kv.split('=')
                             try:
-                                meta[k.strip()] = float(v)
+                                metadata[k] = float(v)
                             except:
-                                pass
+                                metadata[k] = v
                 
-                person_memory[jid]['pose_hints'] = meta
+                person_memory[job_id]['pose'] = status
+                person_memory[job_id]['pose_raw'] = result_text
+                person_memory[job_id]['pose_hints'] = metadata
+                person_memory[job_id]['pose_velocity'] = velocity
                 
-                if "Violent" in status or "Threat" in status:
-                    logger.log_threat("VIOLENCE_DETECTED", jid, {"pose": status, "meta": meta})
-                    send_cmd("WARN_INTRUDER")
-                elif status == "Threat: Surrender":
-                    person_memory[jid]['pose'] = 'SURRENDER'
+                # Check for surrender (hands up with package check)
+                if status == "SURRENDER":
+                    # TODO: Check if holding package before triggering alarm
+                    logger.log_detection(person_memory[job_id].get('camera', 'UNKNOWN'), 
+                                        job_id, "SURRENDER_DETECTED", 0.90, metadata)
             
-            os.remove(f)
+            os.remove(result_file)
         except Exception as e:
-            logger.log_threat("RESULT_PARSE_ERROR", "pose", {"error": str(e)})
+            logger.log_threat("RESULT_PARSE_ERROR", "pose", {"error": str(e), "file": result_file})
 
 # ============================================================================
-# FRAME DISPATCH
+# WORKER DISPATCH
 # ============================================================================
 def dispatch(env, img, jid):
     try:
@@ -452,45 +498,32 @@ def capture(url, q, name):
             except:
                 pass
         q.put(frame)
-    
-    cap.release()
-
-# ============================================================================
-# INITIALIZATION
-# ============================================================================
-for d in ["jobs_face", "results_face", "jobs_pose", "results_pose"]:
-    os.makedirs(d, exist_ok=True)
-    for f in glob.glob(f"{d}/*"):
-        try:
-            os.remove(f)
-        except:
-            pass
 
 threading.Thread(target=capture, args=(RTSP_URL_GATE, q_gate, "GATE"), daemon=True).start()
 threading.Thread(target=capture, args=(RTSP_URL_DOOR, q_door, "DOOR"), daemon=True).start()
 
-print("[SYSTEM] Cameras Active. Entering Main Loop...")
-logger.log_detection("SYSTEM", "MAIN", "LOOP_START", 1.0, {})
+time.sleep(3)
 
 # ============================================================================
-# MAIN PROCESSING LOOP
+# MAIN LOOP
 # ============================================================================
+logger.log_detection("SYSTEM", "MAIN", "STARTING", 1.0, {})
 loop_start = time.time()
 
 while True:
+    frame_cnt += 1
+    
     try:
         img_g = q_gate.get(timeout=1)
         img_d = q_door.get(timeout=1)
     except:
         continue
     
-    frame_cnt += 1
-    iter_start = time.time()
-    
+    # Resize for AI processing
     ai_g = cv2.resize(img_g, (AI_WIDTH, AI_HEIGHT))
     ai_d = cv2.resize(img_d, (AI_WIDTH, AI_HEIGHT))
     
-    # YOLO inference every 3rd frame (10 FPS)
+    # YOLO inference every 3rd frame
     if frame_cnt % 3 == 0:
         yolo_start = time.time()
         
@@ -501,7 +534,6 @@ while True:
         
         logger.log_perf("YOLO", "inference_ms", (time.time() - yolo_start) * 1000)
         
-        # Process detections
         def parse_detections(res, tracker, cam_type, img_src):
             boxes = []
             weapons_detected = []
@@ -511,7 +543,7 @@ while True:
                 cls = int(box.cls[0])
                 coords = box.xyxy[0].cpu().numpy()
                 
-                if cls == 0:  # Person
+                if cls == 0:
                     boxes.append(coords)
                 elif cls in WEAPON_CLASSES:
                     weapons_detected.append({
@@ -525,7 +557,6 @@ while True:
                         'bbox': coords
                     })
             
-            # Update tracker
             tracks = tracker.update(np.array(boxes) if boxes else np.empty((0, 5)))
             
             for d in tracks:
@@ -535,6 +566,7 @@ while True:
                 # Initialize memory
                 if jid not in person_memory:
                     person_memory[jid] = {
+                        'camera': cam_type,
                         'start_time': time.time(),
                         'timestamp': time.time(),
                         'last_box': [x1, y1, x2, y2],
@@ -548,7 +580,8 @@ while True:
                         'status': 'IDLE',
                         'warned': False,
                         'movement': 'IDLE',
-                        'posture': 'IDLE'
+                        'posture': 'IDLE',
+                        'pose_velocity': 0.0
                     }
                 
                 mem = person_memory[jid]
@@ -564,7 +597,7 @@ while True:
                 )
                 mem['movement'] = movement_status
                 
-                # POSTURE ANALYSIS
+                # POSTURE ANALYSIS (using fresh pose_hints from worker)
                 posture_status, post_conf, post_meta = analyze_posture(
                     jid, [x1, y1, x2, y2], AI_HEIGHT, mem['pose_hints']
                 )
@@ -574,34 +607,40 @@ while True:
                 # Crawling always triggers alarm
                 if posture_status == "CRAWLING":
                     logger.log_threat("CRAWLER_ALARM", jid, post_meta)
-                    send_cmd("WARN_INTRUDER")
+                    send_cmd("WARN_CRAWLING", priority=1)
                 
-                # Running/Charging (only if not verified or verified but charging)
+                # Running/Charging
                 if movement_status in ["RUNNING", "CHARGING"]:
                     if mem['identity'] not in AUTHORIZED_USERS or movement_status == "CHARGING":
                         logger.log_threat("RUNNER_ALARM", jid, move_meta)
-                        send_cmd("WARN_RUNNING")
+                        send_cmd("WARN_RUNNING", priority=1)
+                
+                # Violence detection
+                if mem['pose'] == "VIOLENCE" and mem['pose_velocity'] > 1.5:
+                    logger.log_threat("VIOLENCE_ALARM", jid, {"velocity": mem['pose_velocity']})
+                    send_cmd("WARN_INTRUDER", priority=0)
                 
                 # Weapon validation
                 for weapon in weapons_detected:
                     is_valid, reason = validate_weapon(
                         jid, weapon['class'], frame_cnt, weapon['bbox'], 
-                        mem.get('pose_hints', {})
+                        mem.get('pose_hints', {}), AI_WIDTH
                     )
                     if is_valid:
                         logger.log_threat("WEAPON_ALARM", jid, {
                             "weapon": weapon['name'],
                             "reason": reason
                         })
-                        send_cmd("WARN_WEAPON")
+                        send_cmd("WARN_WEAPON", priority=0)
                 
                 # Log state
-                logger.log_detection(cam_type, jid, "STATE_UPDATE", 0.90, {
-                    "movement": movement_status,
-                    "posture": posture_status,
-                    "identity": mem['identity'],
-                    "face": mem['face']
-                })
+                if frame_cnt % 30 == 0:  # Every second at 30fps
+                    logger.log_detection(cam_type, jid, "STATE_UPDATE", 0.90, {
+                        "movement": movement_status,
+                        "posture": posture_status,
+                        "identity": mem['identity'],
+                        "face": mem['face']
+                    })
                 
                 # Update memory
                 mem['last_box'] = [x1, y1, x2, y2]
@@ -609,16 +648,16 @@ while True:
                 mem['center'] = bbox_center([x1, y1, x2, y2])
                 mem['timestamp'] = now_time
                 
-                # Dispatch crops (optimized intervals)
+                # Dispatch crops to workers (BOTH CAMERAS GET BOTH WORKERS)
                 crop = img_src[max(0, y1):min(AI_HEIGHT, y2), max(0, x1):min(AI_WIDTH, x2)]
                 
                 if crop.size > 0:
-                    # Pose every 2nd frame (15 FPS)
-                    if cam_type == 'gate' and frame_cnt % 2 == 0:
+                    # Pose every 2nd frame (15 FPS) - BOTH CAMERAS
+                    if frame_cnt % 2 == 0:
                         dispatch('pose', crop, jid)
                     
-                    # Face every 5th frame (6 FPS) - only door camera
-                    if cam_type == 'door' and frame_cnt % 5 == 0:
+                    # Face every 5th frame (6 FPS) - BOTH CAMERAS
+                    if frame_cnt % 5 == 0:
                         dispatch('face', crop, jid)
         
         parse_detections(res_g, gate_tracker, 'gate', ai_g)
@@ -628,15 +667,16 @@ while True:
     check_results()
     
     # Hostage detection (every 10 frames)
-    if frame_cnt % 10 == 0:
+    if frame_cnt % HOSTAGE_CHECK_INTERVAL == 0:
         verified = {k: v for k, v in person_memory.items() if v['identity'] in AUTHORIZED_USERS}
-        unknown = {k: v for k, v in person_memory.items() if v['identity'] == 'Unknown' and v['face'] == 'Unknown'}
+        unknown = {k: v for k, v in person_memory.items() if v['identity'] == 'Unknown'}
         
-        hostage = detect_hostage_situation(verified, unknown)
-        if hostage:
-            send_cmd("SILENT_ALARM")
+        is_hostage, evidence = detect_hostage_situation(verified, unknown, "door")
+        if is_hostage:
+            logger.log_threat("HOSTAGE_SITUATION", "SYSTEM", evidence)
+            send_cmd("SILENT_ALARM", priority=0)
     
-    # DISPLAY (visual debug)
+    # DISPLAY
     disp_g = cv2.resize(img_g, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
     disp_d = cv2.resize(img_d, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
     sx, sy = DISPLAY_WIDTH / AI_WIDTH, DISPLAY_HEIGHT / AI_HEIGHT
@@ -652,13 +692,13 @@ while True:
             
             # Color coding
             if identity in AUTHORIZED_USERS:
-                color = (0, 255, 0)  # Green
+                color = (0, 255, 0)
             elif posture == "CRAWLING" or movement in ["RUNNING", "CHARGING"]:
-                color = (0, 0, 255)  # Red
+                color = (0, 0, 255)
             elif identity == "Unknown":
-                color = (0, 255, 255)  # Yellow
+                color = (0, 255, 255)
             else:
-                color = (255, 255, 255)  # White
+                color = (255, 255, 255)
             
             x1, y1 = int(box[0] * sx), int(box[1] * sy)
             x2, y2 = int(box[2] * sx), int(box[3] * sy)
@@ -678,7 +718,7 @@ while True:
     
     cv2.imshow("SENTINEL Command Center", comb)
     
-    # Performance logging (every 100 frames)
+    # Performance logging
     if frame_cnt % 100 == 0:
         logger.log_perf("MAIN", "loop_fps", fps)
         logger.log_perf("MAIN", "tracked_persons", len(person_memory))

@@ -1,0 +1,1 @@
+Normal|0.00|hips_y=1.1284,left_wrist_x=1.0099,left_wrist_y=0.7209,right_wrist_x=1.1536,right_wrist_y=0.6780,left_elbow_x=0.7432,left_elbow_y=0.6888,right_elbow_x=0.7601,right_elbow_y=0.7897,velocity=0.0000
