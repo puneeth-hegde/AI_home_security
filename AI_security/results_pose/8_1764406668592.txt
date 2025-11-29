@@ -1,2 +1,0 @@
-track_id:8
-pose_status:SURRENDER

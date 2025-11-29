@@ -1,3 +1,0 @@
-track_id:2
-identity:Unknown
-quality:OK

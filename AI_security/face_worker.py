@@ -4,124 +4,100 @@ import time
 import glob
 import cv2
 import numpy as np
+import warnings
 from deepface import DeepFace
 from collections import deque, Counter
+from datetime import datetime
 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings('ignore')
+
+# --- CONFIGURATION ---
 JOBS_DIR = "jobs_face"
 RESULTS_DIR = "results_face"
-DB_PATH = "dataset"
+DB_PATH = "dataset" 
 MODEL_NAME = "Facenet512"
 DETECTOR_BACKEND = "opencv"
-STRICT_THRESHOLD = 0.30  # Relaxed for steep door camera angles (was 0.22)
 
-BLUR_THRESHOLD = 100
-BRIGHTNESS_LOW = 50
+# --- TUNED SETTINGS ---
+# 0.22 is the sweet spot for angled cameras + Voting
+STRICT_THRESHOLD = 0.22 
+# Voting: Needs 3 matches in the last 5 frames to confirm identity
+VOTE_HISTORY = 5
+VOTE_REQUIRED = 3
 
-os.makedirs(JOBS_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+# Create Dirs
+for d in [JOBS_DIR, RESULTS_DIR]:
+    os.makedirs(d, exist_ok=True)
 
-print("[FACE] Building model...")
-try:
-    DeepFace.build_model(MODEL_NAME)
-    print("[FACE] Ready")
-except Exception as e:
-    print(f"[FACE] Error: {e}")
+print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE] Loading Model...")
+DeepFace.build_model(MODEL_NAME)
+print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE] VOTING ENGINE READY.")
 
+# Memory: { 'door_1': deque(['puneeth', 'Unknown', ...]) }
 vote_memory = {}
 
-def check_blur(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    return laplacian_var < BLUR_THRESHOLD
-
-def check_darkness(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    brightness = np.mean(gray)
-    return brightness < BRIGHTNESS_LOW
-
-def assess_quality(img):
-    if check_blur(img):
-        return "BLUR"
-    elif check_darkness(img):
-        return "DARK"
-    else:
-        return "OK"
-
-def recognize_with_voting(track_id, img):
-    quality = assess_quality(img)
-    if quality != "OK":
-        return "Unknown", quality
-    
-    if track_id not in vote_memory:
-        vote_memory[track_id] = deque(maxlen=5)
-    
-    try:
-        dfs = DeepFace.find(
-            img_path=img,
-            db_path=DB_PATH,
-            model_name=MODEL_NAME,
-            detector_backend=DETECTOR_BACKEND,
-            distance_metric="cosine",
-            enforce_detection=False,
-            silent=True
-        )
-        
-        identity = "Unknown"
-        if len(dfs) > 0 and len(dfs[0]) > 0:
-            best_match = dfs[0].iloc[0]
-            distance = best_match['distance']
-            if distance < STRICT_THRESHOLD:
-                identity_path = best_match['identity']
-                identity = identity_path.split(os.sep)[-2]
-        
-        vote_memory[track_id].append(identity)
-        
-        if len(vote_memory[track_id]) >= 3:
-            vote_counts = Counter(vote_memory[track_id])
-            top_identity, top_count = vote_counts.most_common(1)[0]
-            if top_count >= 3:
-                return top_identity, quality
-        
-        return identity, quality
-    except Exception as e:
-        print(f"[FACE] Recognition error: {e}")
-        return "Unknown", quality
-
-print("[FACE] Worker started")
-
 while True:
-    job_files = glob.glob(os.path.join(JOBS_DIR, "*.jpg"))
-    if len(job_files) == 0:
-        time.sleep(0.1)
-        continue
-    
-    job_path = sorted(job_files)[0]
-    
     try:
-        filename = os.path.basename(job_path)
-        track_id = int(filename.split('_')[0])
-        img = cv2.imread(job_path)
-        
-        if img is None:
-            os.remove(job_path)
+        job_files = glob.glob(os.path.join(JOBS_DIR, "*.jpg"))
+        if not job_files:
+            time.sleep(0.05)
             continue
-        
-        identity, quality = recognize_with_voting(track_id, img)
-        
-        result_filename = f"{track_id}_{int(time.time()*1000)}.txt"
-        result_path = os.path.join(RESULTS_DIR, result_filename)
-        
-        with open(result_path, 'w') as f:
-            f.write(f"track_id:{track_id}\n")
-            f.write(f"identity:{identity}\n")
-            f.write(f"quality:{quality}\n")
-        
-        print(f"[FACE] ID:{track_id} -> {identity} (Quality: {quality})")
-        os.remove(job_path)
-    except Exception as e:
-        print(f"[FACE] Job error: {e}")
-        try:
-            os.remove(job_path)
-        except: pass
-    
-    time.sleep(0.05)
+
+        for job_path in job_files:
+            job_filename = os.path.basename(job_path)
+            job_id = job_filename.split('.')[0] 
+            result_path = os.path.join(RESULTS_DIR, f"result_{job_id}.txt")
+            
+            try:
+                # 1. RECOGNIZE (Single Frame)
+                # enforce_detection=False is CRITICAL for your high camera angle
+                dfs = DeepFace.find(img_path=job_path, db_path=DB_PATH, model_name=MODEL_NAME, 
+                                  detector_backend=DETECTOR_BACKEND, distance_metric="cosine", 
+                                  enforce_detection=False, silent=True)
+                
+                raw_id = "Unknown"
+                dist = 1.0
+                
+                if len(dfs) > 0 and not dfs[0].empty:
+                    dist = dfs[0].iloc[0]["distance"]
+                    
+                    if dist <= STRICT_THRESHOLD:
+                        path = dfs[0].iloc[0]["identity"]
+                        # Handle folder structure (dataset/puneeth/img.jpg)
+                        if os.path.sep in path: 
+                            raw_id = os.path.basename(os.path.dirname(path))
+                        else: 
+                            raw_id = os.path.basename(path).split('.')[0]
+
+                # 2. VOTING LOGIC (Stability)
+                if job_id not in vote_memory: 
+                    vote_memory[job_id] = deque(maxlen=VOTE_HISTORY)
+                
+                vote_memory[job_id].append(raw_id)
+                
+                # Count votes
+                counts = Counter(vote_memory[job_id])
+                most_common, count = counts.most_common(1)[0]
+                
+                # Decision
+                if count >= VOTE_REQUIRED:
+                    final_id = most_common
+                else:
+                    final_id = "Verifying..."
+
+                # VERBOSE LOG
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [FACE] {job_id} Raw: {raw_id} ({dist:.3f}) -> Voted: {final_id} ({count}/{len(vote_memory[job_id])})")
+
+                with open(result_path, "w") as f: f.write(final_id)
+
+            except Exception as e:
+                # print(f"Error: {e}")
+                pass
+            
+            # Cleanup
+            try: os.remove(job_path)
+            except: pass
+
+    except KeyboardInterrupt: break
+    except Exception: time.sleep(0.1)
