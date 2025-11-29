@@ -1,205 +1,155 @@
 import cv2
 import os
 import time
-from datetime import datetime
+import numpy as np
+import torch
+import glob
 import threading
 import queue
-import numpy as np
-import glob
-import torch
 from ultralytics import YOLO
 from sort import Sort
+from datetime import datetime
 
 # --- CONFIGURATION ---
 RTSP_URL_GATE = "rtsp://Gate_Camera:CREAKmyPASSWORD1219!!!@192.168.0.115:554/stream1"
 RTSP_URL_DOOR = "rtsp://Door_Camera:CREAKmyPASSWORD1219!!!@192.168.0.120:554/stream1"
-YOLO_MODEL_PATH = "yolov8n.pt"
+YOLO_MODEL = "yolov8n.pt"
 
-AI_WIDTH, AI_HEIGHT = 640, 360
-DISPLAY_WIDTH, DISPLAY_HEIGHT = 960, 540 
-PROCESS_EVERY_N_FRAMES = 3
+AI_W, AI_H = 640, 360
+DISP_W, DISP_H = 960, 540
 
-# --- WEAPON DETECTION ---
-WEAPON_CLASSES = [43, 76, 34] 
-WEAPON_CONFIDENCE = 0.20
-WEAPON_PERSISTENCE = 10 # Frames to keep alert active
-
-DIRS = ["jobs_face", "results_face", "jobs_pose", "results_pose"]
-
-print("--- MAIN APPLICATION STARTING ---")
+# --- SETUP ---
+print("--- PHASE 2: TRACKING & DISPATCHING ---")
 gpu = torch.cuda.is_available()
 device = 0 if gpu else 'cpu'
-print(f"[{datetime.now().strftime('%H:%M:%S')}] GPU: {gpu}")
-
-model = YOLO(YOLO_MODEL_PATH)
+model = YOLO(YOLO_MODEL)
 model.to(device)
 
-gate_tracker = Sort(max_age=30, min_hits=3, iou_threshold=0.3)
-door_tracker = Sort(max_age=30, min_hits=3, iou_threshold=0.3)
+gate_tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
+door_tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
 
-q_gate = queue.Queue(maxsize=2)
-q_door = queue.Queue(maxsize=2)
-stop_event = threading.Event()
-world_state = {}
+# Shared Memory for Identities
+face_results = {}
 
-def cleanup():
-    while not stop_event.is_set():
-        time.sleep(30)
-        now = time.time()
-        for d in DIRS:
-            if os.path.exists(d):
-                for f in os.listdir(d):
-                    try:
-                        if os.path.getmtime(os.path.join(d, f)) < now - 30: os.remove(os.path.join(d, f))
-                    except: pass
-
-def capture(url, q, name):
-    print(f"[{name}] Connecting...")
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+def capture_thread(url, queue_list, index):
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    while not stop_event.is_set():
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    while True:
         ret, frame = cap.read()
-        if not ret: 
+        if not ret:
             time.sleep(0.5)
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
             continue
-        if q.full():
-            try: q.get_nowait()
-            except: pass
-        q.put(frame)
-    cap.release()
+        queue_list[index] = frame
 
-def dispatch(env, img, jid):
+# Dispatcher: Sends images to Face Worker
+def dispatch_face_job(img, job_id):
     try:
-        d = "jobs_face" if env == 'face_env' else "jobs_pose"
-        cv2.imwrite(f"{d}/{jid}.jpg", img)
+        cv2.imwrite(f"jobs_face/{job_id}.jpg", img)
     except: pass
 
-def check_results():
+# Result Reader: Reads answers from Face Worker
+def check_face_results():
     for f in glob.glob("results_face/*.txt"):
         try:
-            jid = os.path.basename(f).replace('result_', '').replace('.txt', '')
-            with open(f, 'r') as file: res = file.read().strip()
-            if res and res != "Error" and jid in world_state:
-                world_state[jid]['identity'] = res
-            os.remove(f)
-        except: pass
-    for f in glob.glob("results_pose/*.txt"):
-        try:
-            jid = os.path.basename(f).replace('result_', '').replace('.txt', '')
-            with open(f, 'r') as file: res = file.read().strip()
-            if res and res != "Error" and jid in world_state:
-                world_state[jid]['pose'] = res
+            job_id = os.path.basename(f).replace('result_', '').replace('.txt', '')
+            with open(f, 'r') as file: 
+                name = file.read().strip()
+                face_results[job_id] = name
+                print(f"[BRAIN] {job_id} identified as: {name}")
             os.remove(f)
         except: pass
 
-for d in DIRS: 
+# Start Capture
+frames = [None, None]
+threading.Thread(target=capture_thread, args=(RTSP_URL_GATE, frames, 0), daemon=True).start()
+threading.Thread(target=capture_thread, args=(RTSP_URL_DOOR, frames, 1), daemon=True).start()
+
+# Clean folders
+for d in ["jobs_face", "results_face"]:
     if not os.path.exists(d): os.makedirs(d)
     for f in glob.glob(f"{d}/*"): os.remove(f)
 
-threading.Thread(target=capture, args=(RTSP_URL_GATE, q_gate, "GATE"), daemon=True).start()
-threading.Thread(target=capture, args=(RTSP_URL_DOOR, q_door, "DOOR"), daemon=True).start()
-threading.Thread(target=cleanup, daemon=True).start()
+print("[SYSTEM] Ready. Waiting for video...")
+time.sleep(3)
 
-time.sleep(2) 
+while True:
+    if frames[0] is None or frames[1] is None:
+        time.sleep(0.1); continue
 
-frame_cnt = 0
-cached_gate_boxes = []
-cached_door_boxes = []
-weapon_timer = 0
-current_weapon_name = ""
-
-while not stop_event.is_set():
-    try:
-        img_gate = q_gate.get(timeout=1)
-        img_door = q_door.get(timeout=1)
-    except: continue
-
-    frame_cnt += 1
+    # Resize for AI
+    ai_frames = [cv2.resize(f, (AI_W, AI_H)) for f in frames]
     
-    ai_gate = cv2.resize(img_gate, (AI_WIDTH, AI_HEIGHT))
-    ai_door = cv2.resize(img_door, (AI_WIDTH, AI_HEIGHT))
+    # Batch Inference
+    results = model(ai_frames, verbose=False, classes=[0]) 
 
-    if frame_cnt % PROCESS_EVERY_N_FRAMES == 0:
-        found_weapon = False
-        classes = [0] + WEAPON_CLASSES
-        
-        res_gate = model(ai_gate, classes=classes, verbose=False, conf=WEAPON_CONFIDENCE)[0]
-        res_door = model(ai_door, classes=classes, verbose=False, conf=WEAPON_CONFIDENCE)[0]
-
-        gate_boxes, door_boxes = [], []
-
-        def parse(res, box_list):
-            global found_weapon, current_weapon_name
-            if res.boxes:
-                for box in res.boxes:
-                    cls = int(box.cls[0])
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                    
-                    if cls == 0: 
-                        box_list.append([x1, y1, x2, y2])
-                    elif cls in WEAPON_CLASSES:
-                        name = model.names[cls]
-                        found_weapon = True
-                        current_weapon_name = name
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ALERT] WEAPON: {name}")
-
-        parse(res_gate, gate_boxes)
-        parse(res_door, door_boxes)
-        
-        if found_weapon: weapon_timer = WEAPON_PERSISTENCE
-
-        track_gate = gate_tracker.update(np.array(gate_boxes) if gate_boxes else np.empty((0, 5)))
-        track_door = door_tracker.update(np.array(door_boxes) if door_boxes else np.empty((0, 5)))
-        
-        cached_gate_boxes = track_gate
-        cached_door_boxes = track_door
-
-        for d in track_gate:
-            x1, y1, x2, y2, tid = map(int, d)
-            jid = f"gate_{tid}"
-            if jid not in world_state:
-                world_state[jid] = {'identity': 'N/A', 'pose': 'Pending...', 'sent_pose': False}
-                dispatch('pose_env', ai_gate[max(0,y1):min(AI_HEIGHT,y2), max(0,x1):min(AI_WIDTH,x2)], jid)
-
-        for d in track_door:
-            x1, y1, x2, y2, tid = map(int, d)
-            jid = f"door_{tid}"
-            if jid not in world_state:
-                world_state[jid] = {'identity': 'Pending...', 'pose': 'Pending...', 'sent_face': False}
-                dispatch('face_env', ai_door[max(0,y1):min(AI_HEIGHT,y2), max(0,x1):min(AI_WIDTH,x2)], jid)
-
-    check_results()
-
-    sx = DISPLAY_WIDTH / AI_WIDTH
-    sy = DISPLAY_HEIGHT / AI_HEIGHT
-    disp_gate = cv2.resize(img_gate, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-    disp_door = cv2.resize(img_door, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
-
-    for d in cached_gate_boxes:
-        x1, y1, x2, y2, tid = map(int, d)
-        jid = f"gate_{tid}"
-        pose = world_state.get(jid, {}).get('pose', '...')
-        color = (0,0,255) if "Threat" in pose else (0,255,0)
-        cv2.rectangle(disp_gate, (int(x1*sx), int(y1*sy)), (int(x2*sx), int(y2*sy)), color, 2)
-        cv2.putText(disp_gate, pose, (int(x1*sx), int(y1*sy)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-    for d in cached_door_boxes:
-        x1, y1, x2, y2, tid = map(int, d)
-        jid = f"door_{tid}"
-        ident = world_state.get(jid, {}).get('identity', '...')
-        color = (0,255,0) if ident == 'puneeth' else (0,0,255)
-        cv2.rectangle(disp_door, (int(x1*sx), int(y1*sy)), (int(x2*sx), int(y2*sy)), color, 2)
-        cv2.putText(disp_door, ident, (int(x1*sx), int(y1*sy)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-    combined = cv2.hconcat([disp_gate, disp_door])
+    display_frames = []
+    check_face_results() # Check for names every loop
     
-    if weapon_timer > 0:
-        cv2.rectangle(combined, (0,0), (combined.shape[1], 80), (0,0,255), -1)
-        cv2.putText(combined, f"WEAPON DETECTED: {current_weapon_name.upper()}", (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 4)
-        weapon_timer -= 1
+    for i, res in enumerate(results):
+        cam_name = "GATE" if i == 0 else "DOOR"
+        tracker = gate_tracker if i == 0 else door_tracker
+        
+        # Get Detections
+        dets = []
+        for box in res.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0])
+            if conf > 0.4: dets.append([x1, y1, x2, y2, conf])
+        
+        # Update Tracker
+        tracks = tracker.update(np.array(dets) if dets else np.empty((0, 5)))
+        
+        # Draw
+        disp = cv2.resize(frames[i], (DISP_W, DISP_H))
+        sx = DISP_W / AI_W
+        sy = DISP_H / AI_H
 
-    cv2.imshow("Security System (FINAL)", combined)
+        for t in tracks:
+            x1, y1, x2, y2, tid = map(int, t)
+            uid = f"{cam_name.lower()}_{tid}"
+            
+            # --- 1. CRAWLING LOGIC (From Phase 1) ---
+            w, h = x2 - x1, y2 - y1
+            aspect = w / h
+            is_low = y2 > (AI_H * 0.9)
+            
+            status = "STANDING"
+            color = (0, 255, 0)
+            
+            if aspect > 1.2 and is_low:
+                status = "CRAWLING"
+                color = (0, 0, 255)
+                print(f"[ALERT] {uid} is CRAWLING!")
+
+            # --- 2. FACE DISPATCH LOGIC (New for Phase 2) ---
+            # Only send door camera images to Face Worker
+            if cam_name == "DOOR":
+                # Send crop to worker
+                crop = ai_frames[i][max(0,y1):min(AI_H,y2), max(0,x1):min(AI_W,x2)]
+                if crop.size > 0:
+                    dispatch_face_job(crop, uid)
+                
+                # Get Identity from memory
+                identity = face_results.get(uid, "Scanning...")
+                
+                # Color logic for identity
+                if identity == "puneeth": color = (0, 255, 0) # Green
+                elif identity == "Unknown": color = (0, 0, 255) # Red
+                
+                label = f"{uid} | {status} | {identity}"
+                cv2.rectangle(disp, (int(x1*sx), int(y1*sy)), (int(x2*sx), int(y2*sy)), color, 2)
+                cv2.putText(disp, label, (int(x1*sx), int(y1*sy)-10), 1, 1.5, color, 2)
+            else:
+                # Gate Camera Logic (Just Crawling for now)
+                label = f"{uid} | {status}"
+                cv2.rectangle(disp, (int(x1*sx), int(y1*sy)), (int(x2*sx), int(y2*sy)), color, 2)
+                cv2.putText(disp, label, (int(x1*sx), int(y1*sy)-10), 1, 1.5, color, 2)
+
+        display_frames.append(disp)
+
+    combined = cv2.hconcat(display_frames)
+    cv2.imshow("Phase 2 Test", combined)
     if cv2.waitKey(1) == ord('q'): break
 
-stop_event.set()
 cv2.destroyAllWindows()
