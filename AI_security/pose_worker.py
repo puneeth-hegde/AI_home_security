@@ -1,123 +1,157 @@
 import os
 import time
 import cv2
-import glob
 import math
+import glob
+import numpy as np
 import mediapipe as mp
 from collections import deque
-from datetime import datetime
 
-# --- CONFIGURATION ---
 JOBS_DIR = "jobs_pose"
 RESULTS_DIR = "results_pose"
-PROCESSING_DIR = "jobs_pose_processing"
 
-# --- INTELLIGENCE SETTINGS ---
-VIOLENCE_SPEED_THRESHOLD = 0.04  # Sensitivity for punching
-HISTORY_SIZE = 5                 # Frames to remember for speed calc
+VIOLENCE_SPEED_THRESHOLD = 0.04
+HISTORY_SIZE = 5
 
-# Initialize MediaPipe
+os.makedirs(JOBS_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=True, model_complexity=1, min_detection_confidence=0.5)
 
-# Memory for Velocity Tracking
+print("[POSE] MediaPipe ready")
+
 tracking_memory = {}
 
-# Ensure Directories exist
-os.makedirs(JOBS_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(PROCESSING_DIR, exist_ok=True)
-
-print(f"[{datetime.now().strftime('%H:%M:%S')}] [POSE_WORKER] Phase 2 Engine Ready.")
-
-def calculate_distance(point_a, point_b):
-    return math.sqrt((point_a.x - point_b.x)**2 + (point_a.y - point_b.y)**2)
-
-def analyze_violence(landmarks, job_id):
-    # 1. Get Key Points
-    nose = landmarks[mp_pose.PoseLandmark.NOSE]
-    left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
-    right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
+class PoseHistory:
+    def __init__(self):
+        self.wrist_history = deque(maxlen=HISTORY_SIZE)
+        self.elbow_history = deque(maxlen=HISTORY_SIZE)
+        self.shoulder_history = deque(maxlen=HISTORY_SIZE)
     
-    # 2. Check Surrender (Wrists above Nose)
-    # Note: In image coordinates, Y=0 is the top. So Less Y = Higher Up.
-    if (left_wrist.y < nose.y) and (right_wrist.y < nose.y):
-        return "Threat: Surrender Pose"
+    def add_frame(self, wrists, elbows, shoulders):
+        self.wrist_history.append(wrists)
+        self.elbow_history.append(elbows)
+        self.shoulder_history.append(shoulders)
+    
+    def is_full(self):
+        return len(self.wrist_history) >= HISTORY_SIZE
 
-    # 3. Check Velocity (Punching/Shoving)
-    current_data = {
-        'left': (left_wrist.x, left_wrist.y), 
-        'right': (right_wrist.x, right_wrist.y), 
-        'time': time.time()
-    }
-    
-    # Init memory if new
-    if job_id not in tracking_memory: 
-        tracking_memory[job_id] = deque(maxlen=HISTORY_SIZE)
-    
-    tracking_memory[job_id].append(current_data)
-    
-    # Need at least 2 frames to calculate speed
-    if len(tracking_memory[job_id]) < 2: 
-        return "Normal"
-    
-    # Calculate speed between oldest and newest frame in buffer
-    start = tracking_memory[job_id][0]
-    end = tracking_memory[job_id][-1]
-    dt = end['time'] - start['time']
-    
-    if dt > 0 and dt < 1.0: # Ignore if frames are too far apart (lag)
-        l_dist = math.sqrt((start['left'][0]-end['left'][0])**2 + (start['left'][1]-end['left'][1])**2)
-        r_dist = math.sqrt((start['right'][0]-end['right'][0])**2 + (start['right'][1]-end['right'][1])**2)
-        
-        speed = max(l_dist, r_dist) / dt
-        
-        if speed > VIOLENCE_SPEED_THRESHOLD:
-            return "Threat: Violent Motion"
+def calculate_angle(a, b, c):
+    ba = np.array([a[0] - b[0], a[1] - b[1]])
+    bc = np.array([c[0] - b[0], c[1] - b[1]])
+    cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    angle = np.arccos(np.clip(cosine, -1.0, 1.0))
+    return np.degrees(angle)
 
-    return "Normal"
-
-# --- MAIN LOOP ---
-while True:
+def check_surrender(landmarks):
     try:
-        job_files = glob.glob(os.path.join(JOBS_DIR, "*.jpg"))
+        left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+        right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
+        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        left_elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
+        right_elbow = landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value]
         
-        if not job_files:
-            time.sleep(0.05)
+        left_raised = left_wrist.y < left_shoulder.y
+        right_raised = right_wrist.y < right_shoulder.y
+        
+        left_angle = calculate_angle((left_wrist.x, left_wrist.y), (left_elbow.x, left_elbow.y), (left_shoulder.x, left_shoulder.y))
+        right_angle = calculate_angle((right_wrist.x, right_wrist.y), (right_elbow.x, right_elbow.y), (right_shoulder.x, right_shoulder.y))
+        
+        if left_raised and right_raised:
+            if left_angle < 100 and right_angle < 100:
+                return True
+        return False
+    except:
+        return False
+
+def check_violence(track_id, landmarks):
+    if track_id not in tracking_memory:
+        tracking_memory[track_id] = PoseHistory()
+    
+    history = tracking_memory[track_id]
+    
+    try:
+        left_wrist = (landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y)
+        right_wrist = (landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y)
+        left_elbow = (landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y)
+        right_elbow = (landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y)
+        left_shoulder = (landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y)
+        right_shoulder = (landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y)
+        
+        history.add_frame((left_wrist, right_wrist), (left_elbow, right_elbow), (left_shoulder, right_shoulder))
+        
+        if not history.is_full():
+            return False
+        
+        old_wrists = history.wrist_history[0]
+        new_wrists = history.wrist_history[-1]
+        
+        left_movement = math.sqrt((new_wrists[0][0] - old_wrists[0][0])**2 + (new_wrists[0][1] - old_wrists[0][1])**2)
+        right_movement = math.sqrt((new_wrists[1][0] - old_wrists[1][0])**2 + (new_wrists[1][1] - old_wrists[1][1])**2)
+        
+        max_movement = max(left_movement, right_movement)
+        
+        if max_movement > VIOLENCE_SPEED_THRESHOLD:
+            return True
+        return False
+    except:
+        return False
+
+def analyze_pose(track_id, img):
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = pose.process(img_rgb)
+    
+    if not results.pose_landmarks:
+        return "NORMAL"
+    
+    landmarks = results.pose_landmarks.landmark
+    
+    if check_surrender(landmarks):
+        return "SURRENDER"
+    
+    if check_violence(track_id, landmarks):
+        return "VIOLENCE"
+    
+    return "NORMAL"
+
+print("[POSE] Worker started")
+
+while True:
+    job_files = glob.glob(os.path.join(JOBS_DIR, "*.jpg"))
+    if len(job_files) == 0:
+        time.sleep(0.1)
+        continue
+    
+    job_path = sorted(job_files)[0]
+    
+    try:
+        filename = os.path.basename(job_path)
+        track_id = int(filename.split('_')[0])
+        img = cv2.imread(job_path)
+        
+        if img is None:
+            os.remove(job_path)
             continue
-
-        for job_path in job_files:
-            job_filename = os.path.basename(job_path)
-            job_id = job_filename.split('.')[0] 
-            result_path = os.path.join(RESULTS_DIR, f"result_{job_id}.txt")
-            processing_path = os.path.join(PROCESSING_DIR, job_filename)
-            
-            try:
-                shutil.move(job_path, processing_path)
-            except: continue
-
-            try:
-                image = cv2.imread(processing_path)
-                if image is None: raise Exception("Empty")
-                
-                # Run AI
-                results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-                
-                status = "Normal"
-                if results.pose_landmarks:
-                    status = analyze_violence(results.pose_landmarks.landmark, job_id)
-                    
-                    # Log threats to console for Phase 2 Testing
-                    if "Threat" in status:
-                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [ALERT] {status} on {job_id}")
-                
-                with open(result_path, "w") as f: f.write(status)
-
-            except:
-                with open(result_path, "w") as f: f.write("Error")
-            
-            # Cleanup
-            if os.path.exists(processing_path): os.remove(processing_path)
-
-    except KeyboardInterrupt: break
-    except Exception: time.sleep(0.1)
+        
+        pose_status = analyze_pose(track_id, img)
+        
+        result_filename = f"{track_id}_{int(time.time()*1000)}.txt"
+        result_path = os.path.join(RESULTS_DIR, result_filename)
+        
+        with open(result_path, 'w') as f:
+            f.write(f"track_id:{track_id}\n")
+            f.write(f"pose_status:{pose_status}\n")
+        
+        if pose_status != "NORMAL":
+            print(f"[POSE] ID:{track_id} -> {pose_status}")
+        
+        os.remove(job_path)
+    except Exception as e:
+        print(f"[POSE] Job error: {e}")
+        try:
+            os.remove(job_path)
+        except: pass
+    
+    time.sleep(0.05)

@@ -1,0 +1,2 @@
+track_id:7
+pose_status:NORMAL
